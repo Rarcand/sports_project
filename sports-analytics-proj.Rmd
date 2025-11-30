@@ -1,0 +1,160 @@
+---
+title: "Ray_Methods"
+output: html_document
+date: "2025-11-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data Loading
+
+```{r}
+library(tidyverse)
+
+mlb <- read_csv("mlb_stats.csv", show_col_types = FALSE) %>%
+  rename(Name = G)npb <- read.csv("npb_stats.csv")
+
+mlb_prep <- mlb %>% select(SEASON, PA, SO, BB, HR) %>% mutate(League = "MLB")
+npb_prep <- npb %>% mutate(SEASON = Season) %>% select(SEASON, PA, SO, BB, HR) %>% mutate(League = "NPB")
+
+combined_data <- bind_rows(mlb_prep, npb_prep) %>%
+  filter(SEASON >= 2020, SEASON <= 2025) %>%
+  mutate(
+    K_Rate = SO / PA,
+    BB_Rate = BB / PA,
+    HR_Rate = HR / PA
+  ) %>%
+  group_by(SEASON, League) %>%
+  summarise(
+    Strikeout_Pct = mean(K_Rate, na.rm = TRUE),
+    Walk_Pct = mean(BB_Rate, na.rm = TRUE),
+    Homerun_Pct = mean(HR_Rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+## MLB vs. NPB
+
+```{r}
+
+p1 <- ggplot(combined_data, aes(x = SEASON, y = Strikeout_Pct, color = League)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("NPB" = "red", "MLB" = "blue")) + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2020:2025) +
+  labs(
+    title = "Strikeout Rate Comparison (K%)",
+    subtitle = "Measures difficulty of pitch velocity/movement",
+    y = "K %", x = "Season"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+print(p1)
+
+p2 <- ggplot(combined_data, aes(x = SEASON, y = Walk_Pct, color = League)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("NPB" = "red", "MLB" = "blue")) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2020:2025) +
+  labs(
+    title = "Walk Rate Comparison (BB%)",
+    subtitle = "Measures plate discipline translation",
+    y = "BB %", x = "Season"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+print(p2)
+
+p3 <- ggplot(combined_data, aes(x = SEASON, y = Homerun_Pct, color = League)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("NPB" = "red", "MLB" = "blue")) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2020:2025) +
+  labs(
+    title = "Home Run Rate Comparison (HR%)",
+    subtitle = "Measures power translation",
+    y = "HR %", x = "Season"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+print(p3)
+```
+
+```{r}
+
+library(lubridate)
+
+posting_raw <- read.csv("posting_system.csv", stringsAsFactors = FALSE)
+
+valid_npb_teams <- c(
+  "Yomiuri", "Hanshin", "Seibu", "Rakuten", "Marines",
+  "Swallows", "BayStars", "Dragons", "Carp", 
+  "Fighters", "Buffaloes", "Hawks", "BlueWave", "Kintetsu"
+)
+
+manifest <- posting_raw %>%
+  mutate(
+    Post_Date_Clean = mdy(Posting.Date),
+    Post_Year = year(Post_Date_Clean),
+    Post_Month = month(Post_Date_Clean),
+    MLB_First_Season = if_else(Post_Month >= 11, Post_Year + 1, Post_Year),
+    NPB_Final_Season = MLB_First_Season - 1
+  ) %>%
+  filter(
+    MLB_First_Season >= 2015,
+    str_detect(NPB.Team, paste(valid_npb_teams, collapse = "|")),
+    !str_detect(tolower(MLB.Team), "none")
+  ) %>%
+  select(Player, NPB.Team, MLB.Team, NPB_Final_Season, MLB_First_Season)
+
+```
+
+## Retrieve Final Dataset
+
+```{r}
+library(fs)
+
+file_list <- dir_ls("npb_data", glob = "*.txt")
+
+npb_full <- file_list %>% 
+  map_dfr(function(file_path) {
+    read_csv(file_path, show_col_types = FALSE) %>% 
+      mutate(Season = as.numeric(str_extract(path_file(file_path), "\\d{4}")))
+  })
+
+npb_transition <- npb_full %>%
+  mutate(Name = str_trim(Name)) %>% # Clean potential whitespace
+  inner_join(manifest, by = c("Name" = "Player", "Season" = "NPB_Final_Season")) %>%
+  mutate(League = "NPB") %>%
+  select(Name, Season, League, PA, SO, BB, HR) # Select key counting stats
+
+# 2. Get the subsequent MLB seasons for each posted player
+# We join the manifest to the MLB data, keeping only years on or after their debut
+mlb_transition <- mlb %>%
+  mutate(Name = str_trim(Name)) %>%
+  inner_join(manifest, by = c("Name" = "Player")) %>%
+  filter(SEASON >= MLB_First_Season) %>%
+  mutate(League = "MLB") %>%
+  rename(Season = SEASON) %>% # Standardize 'Season' to match NPB for binding
+  select(Name, Season, League, PA, SO, BB, HR)
+
+# 3. Combine into one master dataset
+transition_data <- bind_rows(npb_transition, mlb_transition) %>%
+  arrange(Name, Season) %>%
+  mutate(
+    K_Rate = SO / PA,
+    BB_Rate = BB / PA,
+    HR_Rate = HR / PA
+  )
+
+
+```
