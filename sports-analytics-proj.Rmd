@@ -1,6 +1,8 @@
 ---
 title: "Ray_Methods"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 date: "2025-11-30"
 ---
 
@@ -14,7 +16,8 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 
 mlb <- read_csv("mlb_stats.csv", show_col_types = FALSE) %>%
-  rename(Name = G)npb <- read.csv("npb_stats.csv")
+  rename(Name = G...2)
+npb <- read.csv("npb_stats.csv")
 
 mlb_prep <- mlb %>% select(SEASON, PA, SO, BB, HR) %>% mutate(League = "MLB")
 npb_prep <- npb %>% mutate(SEASON = Season) %>% select(SEASON, PA, SO, BB, HR) %>% mutate(League = "NPB")
@@ -107,7 +110,7 @@ manifest <- posting_raw %>%
     Post_Year = year(Post_Date_Clean),
     Post_Month = month(Post_Date_Clean),
     MLB_First_Season = if_else(Post_Month >= 11, Post_Year + 1, Post_Year),
-    NPB_Final_Season = MLB_First_Season - 1
+    NPB_Final_Season = MLB_First_Season - 1,
   ) %>%
   filter(
     MLB_First_Season >= 2015,
@@ -115,10 +118,10 @@ manifest <- posting_raw %>%
     !str_detect(tolower(MLB.Team), "none")
   ) %>%
   select(Player, NPB.Team, MLB.Team, NPB_Final_Season, MLB_First_Season)
-
+  
 ```
 
-## Retrieve Final Dataset
+## Retrieve Batter Manifest
 
 ```{r}
 library(fs)
@@ -132,29 +135,376 @@ npb_full <- file_list %>%
   })
 
 npb_transition <- npb_full %>%
-  mutate(Name = str_trim(Name)) %>% # Clean potential whitespace
+  mutate(Name = str_trim(Name)) %>%
   inner_join(manifest, by = c("Name" = "Player", "Season" = "NPB_Final_Season")) %>%
   mutate(League = "NPB") %>%
-  select(Name, Season, League, PA, SO, BB, HR) # Select key counting stats
+  select(Name, Season, League, PA, SO, BB, HR)
 
-# 2. Get the subsequent MLB seasons for each posted player
-# We join the manifest to the MLB data, keeping only years on or after their debut
 mlb_transition <- mlb %>%
   mutate(Name = str_trim(Name)) %>%
   inner_join(manifest, by = c("Name" = "Player")) %>%
   filter(SEASON >= MLB_First_Season) %>%
   mutate(League = "MLB") %>%
-  rename(Season = SEASON) %>% # Standardize 'Season' to match NPB for binding
+  rename(Season = SEASON) %>%
   select(Name, Season, League, PA, SO, BB, HR)
 
-# 3. Combine into one master dataset
-transition_data <- bind_rows(npb_transition, mlb_transition) %>%
+main_transition <- bind_rows(npb_transition, mlb_transition)
+
+
+tsutsugo_raw <- read.csv("yoshi_tsutsugo.txt")
+
+tsutsugo_clean <- tsutsugo_raw %>%
+  filter(!Team %in% c("3TM", "2TM")) %>%
+  mutate(
+    Name = "Yoshi Tsutsugo",
+    League = "MLB"
+  ) %>%
+  select(Name, Season, League, PA, SO, BB, HR)
+
+
+batter_transition_data <- bind_rows(main_transition, tsutsugo_clean) %>%
   arrange(Name, Season) %>%
   mutate(
     K_Rate = SO / PA,
     BB_Rate = BB / PA,
     HR_Rate = HR / PA
   )
+batter_transition_data_final <- batter_transition_data %>%
+  group_by(Name, Season, League) %>%
+  summarise(
+    PA = sum(PA, na.rm = TRUE),
+    SO = sum(SO, na.rm = TRUE),
+    BB = sum(BB, na.rm = TRUE),
+    HR = sum(HR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    K_Rate = SO / PA,
+    BB_Rate = BB / PA,
+    HR_Rate = HR / PA
+  )
+```
+
+## Retrieve Pitcher Manifest
+
+```{r warning=FALSE}
+
+pitcher_manifest <- manifest %>% 
+  filter(!Player %in% unique(batter_transition_data_final$Name))
+
+pitcher_list <- dir_ls("pitchers", glob = "*.txt")
+
+raw_pitcher_data <- pitcher_list %>%
+  map_dfr(function(file_path) {
+    player_name <- path_file(file_path) %>%
+      str_remove("\\.txt$") %>%
+      str_replace_all("_", " ")
+    
+    read_csv(file_path, show_col_types = FALSE) %>%
+      mutate(
+        Year = as.numeric(Year),
+        Name = player_name
+      )
+  })
+
+pitcher_transition_data <- raw_pitcher_data %>%
+  inner_join(pitcher_manifest, by = c("Name" = "Player")) %>%
+  filter(
+    (Year == NPB_Final_Season & Lev == "Fgn" & !Lg %in% c("JPWL", "JPEL")) |
+    (Year >= MLB_First_Season & Lev == "Maj")
+  ) %>%
+  filter(!Tm %in% c("2 Teams", "3 Teams")) %>%
+  mutate(
+    League = if_else(Lev == "Fgn", "NPB", "MLB"),
+    Season = Year
+  ) %>%
+  select(Name, Season, League, ERA, IP, SO, BB, WHIP) %>%
+  arrange(Name, Season)
 
 
+pitcher_transition_final <- pitcher_transition_data %>%
+  mutate(
+    Outs = floor(IP) * 3 + round((IP %% 1) * 10)
+  ) %>%
+  group_by(Name, Season, League) %>%
+  summarise(
+    Total_Outs = sum(Outs, na.rm = TRUE),
+    SO = sum(SO, na.rm = TRUE),
+    BB = sum(BB, na.rm = TRUE),
+    Estimated_ER = sum((ERA * IP) / 9 * IP, na.rm = TRUE) / sum(IP, na.rm = TRUE) * 9,
+    ERA = weighted.mean(ERA, Outs, na.rm = TRUE), 
+    WHIP = weighted.mean(WHIP, Outs, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    IP = floor(Total_Outs / 3) + (Total_Outs %% 3) / 10,
+    K_9 = (SO * 9) / (Total_Outs / 3),
+    BB_9 = (BB * 9) / (Total_Outs / 3)
+  ) %>%
+  select(Name, Season, League, IP, ERA, WHIP, SO, BB, K_9, BB_9)
+
+```
+
+## wOBA
+
+```{r}
+woba_weights <- tibble(
+  Season = 2015:2025,
+  wBB = c(0.687, 0.691, 0.693, 0.690, 0.690, 0.699, 0.692, 0.689, 0.696, 0.689, 0.691),
+  wHBP = c(0.718, 0.721, 0.723, 0.720, 0.719, 0.728, 0.722, 0.720, 0.726, 0.720, 0.722),
+  w1B = c(0.881, 0.878, 0.877, 0.880, 0.870, 0.883, 0.879, 0.884, 0.883, 0.882, 0.882),
+  w2B = c(1.256, 1.242, 1.232, 1.247, 1.217, 1.238, 1.242, 1.261, 1.244, 1.254, 1.252),
+  w3B = c(1.594, 1.569, 1.552, 1.578, 1.529, 1.558, 1.568, 1.601, 1.569, 1.590, 1.584),
+  wHR = c(2.065, 2.015, 1.980, 2.031, 1.940, 1.979, 2.007, 2.072, 2.004, 2.050, 2.037)
+)
+tsutsugo_for_woba <- tsutsugo_raw %>%
+  filter(!Team %in% c("3TM", "2TM")) %>%
+  mutate(
+    Name = "Yoshi Tsutsugo",
+    Season = Season, 
+    League = "MLB"
+  ) %>%
+  select(
+    Name, Season, PA, H, `X2B`, `X3B`, HR, BB, HBP, IBB
+  ) %>%
+  rename("2B"=X2B) %>%
+  rename("3B"=X3B)
+
+mlb_raw <- read_csv("mlb_stats.csv", show_col_types = FALSE) %>%
+  rename(Name = `G...2`) %>%
+  rename(Season = SEASON) %>%
+  filter(Season >= 2015) %>%
+  select(Name, Season, PA, H, `2B`, `3B`, HR, BB, HBP, IBB) %>%
+  bind_rows(tsutsugo_for_woba)
+
+mlb_births <- read_csv("MLB_BirthYears.csv", show_col_types = FALSE)
+
+
+
+mlb_raw_with_age <- mlb_raw %>%
+  mutate(Name = str_trim(Name)) %>%
+  left_join(mlb_births, by = "Name") %>%
+  mutate(
+    Age_Offset = if_else(birthMonth > 6, 1, 0),
+    Age = Season - birthYear - Age_Offset
+  ) %>%
+  filter(!is.na(Age), !is.na(PA)) %>%
+
+  select(-playerID, -birthYear, -birthMonth, -birthDay, -Age_Offset)
+
+
+file_list <- dir_ls("npb_data", glob = "*.txt")
+npb_raw <- file_list %>% 
+  map_dfr(function(file_path) {
+    read_csv(file_path, show_col_types = FALSE) %>% 
+      mutate(Season = as.numeric(str_extract(path_file(file_path), "\\d{4}")))
+  }) %>%
+  filter(Season >= 2015) # Apply 2015 filter
+
+
+process_woba <- function(df, league_name) {
+  df %>%
+    mutate(
+      Name = str_trim(Name),
+      H1B = H - `2B` - `3B` - HR,
+      League = league_name
+    ) %>%
+    left_join(woba_weights, by = "Season") %>%
+    mutate(
+      wOBA_Num = (wBB * BB) + (wHBP * HBP) + (w1B * H1B) + (w2B * `2B`) + (w3B * `3B`) + (wHR * HR),
+      wOBA_Denom = PA - IBB
+    ) %>%
+    drop_na(wOBA_Num, wOBA_Denom, Age) %>%
+    select(Name, Season, Age, League, PA, wOBA_Num, wOBA_Denom)
+}
+
+mlb_woba <- process_woba(mlb_raw_with_age, "MLB")
+npb_woba <- process_woba(npb_raw, "NPB")
+
+```
+
+
+## League-Adjusted Comparison (z-scores):
+
+```{r}
+library(ggrepel)
+
+process_woba_fixed <- function(df, league_name) {
+  df %>%
+    mutate(
+      Name = str_trim(Name),
+      H1B = H - `2B` - `3B` - HR,
+      League = league_name
+    ) %>%
+    left_join(woba_weights, by = "Season") %>%
+    mutate(
+      wOBA_Num = (wBB * BB) + (wHBP * HBP) + (w1B * H1B) + (w2B * `2B`) + (w3B * `3B`) + (wHR * HR),
+      wOBA_Denom = PA - IBB
+    ) %>%
+    # FIX: Aggregate Split Seasons (Summing stats by Player/Year)
+    group_by(Name, Season, League, Age) %>% 
+    summarise(
+      wOBA_Num = sum(wOBA_Num, na.rm = TRUE),
+      wOBA_Denom = sum(wOBA_Denom, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+mlb_woba_clean <- process_woba_fixed(mlb_raw_with_age, "MLB")
+npb_woba_clean <- process_woba_fixed(npb_raw, "NPB")
+
+manifest_fixed <- manifest %>%
+  mutate(
+    Player = case_when(
+      Player == "Yoshitomo Tsutsugo" ~ "Yoshi Tsutsugo",
+      TRUE ~ Player
+    ))
+
+all_player_stats <- bind_rows(mlb_woba_clean, npb_woba_clean) %>%
+  inner_join(manifest_fixed, by = c("Name" = "Player")) %>%
+  filter(
+    (League == "NPB" & Season == NPB_Final_Season) |
+    (League == "MLB" & Season >= MLB_First_Season)
+  ) %>%
+  group_by(Name, Season, League, Age) %>%
+  summarise(
+    wOBA_Num = sum(wOBA_Num, na.rm = TRUE),
+    wOBA_Denom = sum(wOBA_Denom, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Player_wOBA = wOBA_Num / wOBA_Denom) %>%
+  filter(is.finite(Player_wOBA))
+
+
+
+
+    
+regression_data <- all_player_stats %>%
+  inner_join(manifest_fixed, by = c("Name" = "Player")) %>%
+  
+  filter(
+    (League == "NPB" & Season == NPB_Final_Season) |
+    (League == "MLB" & Season == MLB_First_Season)
+  ) %>%
+    group_by(Name, League) %>%
+  summarise(
+    wOBA = sum(wOBA_Num) / sum(wOBA_Denom),
+    Age = max(Age), 
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = League, 
+    values_from = c(wOBA, Age)
+  ) %>%
+
+  select(
+    Name,
+    NPB_Final_wOBA = wOBA_NPB,
+    MLB_Year1_wOBA = wOBA_MLB,
+    Age = Age_MLB
+  ) %>%
+  filter(!is.na(NPB_Final_wOBA) & !is.na(MLB_Year1_wOBA))
+
+print(regression_data)
+
+model <- lm(MLB_Year1_wOBA ~ NPB_Final_wOBA + Age, data = regression_data)
+summary(model)
+
+# --- Plot ---
+ggplot(regression_data, aes(x = NPB_Final_wOBA, y = MLB_Year1_wOBA)) +
+  geom_point(aes(color = Age), size = 4) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "black") +
+  geom_text_repel(aes(label = Name)) +
+  labs(
+    title = "Regression: NPB Final Year vs. MLB Year 1",
+    x = "NPB wOBA (Final Season)",
+    y = "MLB wOBA (Rookie Season)"
+  ) +
+  theme_minimal()
+
+```
+## Residuals
+
+```{r}
+residuals_df <- regression_data %>%
+  mutate(
+    Predicted_wOBA = predict(model, newdata = .),
+    Residual = MLB_Year1_wOBA - Predicted_wOBA
+  )
+
+ggplot(residuals_df, aes(x = reorder(Name, Residual), y = Residual, fill = Residual > 0)) +
+  geom_col(alpha = 0.8) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("firebrick", "forestgreen"), 
+    labels = c("Underperformed Model", "Overperformed Model")
+  ) +
+  labs(
+    title = "Performance vs. Expectation (Residuals)",
+    subtitle = "Did the player hit better or worse in MLB than their NPB stats/Age predicted?",
+    y = "Residual (Actual wOBA - Predicted wOBA)",
+    x = "",
+    fill = "Result"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+## Time Adjustment
+```{r}
+long_term_names <- all_player_stats %>%
+  filter(League == "MLB") %>%
+  group_by(Name) %>%
+  filter(n() >= 3) %>%
+  pull(Name) %>%
+  unique()
+
+time_plot_df <- all_player_stats %>%
+  filter(Name %in% long_term_names) %>%
+  group_by(Name, League) %>%
+  arrange(Season) %>%
+  mutate(Season_Rank = row_number()) %>%
+  group_by(Name) %>%
+  
+  mutate(
+    Stage = case_when(
+      League == "NPB" ~ "NPB Final",  # <--- Fixed missing "~" here
+      League == "MLB" & Season_Rank == 1 ~ "MLB Year 1",
+      League == "MLB" & Season_Rank == 2 ~ "MLB Year 2",
+      League == "MLB" & Season_Rank == 3 ~ "MLB Year 3",
+      TRUE ~ NA_character_
+    ),
+    Rookie_Age = min(Age[League == "MLB"], na.rm = TRUE)
+  ) %>%
+  
+  filter(!is.na(Stage)) %>%
+  ungroup() %>%
+  
+  mutate(
+    Age_Group = case_when(
+      Rookie_Age <= 26 ~ "Young (<=26)",
+      Rookie_Age >= 29 ~ "Veteran (29+)",
+      TRUE ~ "Prime (27-28)"
+    ),
+    Stage = factor(Stage, levels = c("NPB Final", "MLB Year 1", "MLB Year 2", "MLB Year 3"))
+  )
+
+
+ggplot(time_plot_df, aes(x = Stage, y = Player_wOBA, group = Name, color = Age_Group)) +
+  geom_line(linewidth = 1.2, alpha = 0.8) +
+  geom_point(size = 3) +
+  geom_label_repel(
+    data = time_plot_df %>% filter(Stage == "MLB Year 1"), 
+    aes(label = Name), 
+    nudge_y = 0.02, 
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "Transition Trajectory by Age Group",
+    subtitle = "Tracking wOBA from Japan through first 3 *Active* MLB Seasons",
+    y = "wOBA",
+    x = "",
+    color = "Age at Debut"
+  ) +
+  theme_minimal()
 ```
